@@ -1,151 +1,119 @@
----
-name: qmd
-description: Search personal markdown knowledge bases, notes, meeting transcripts, and documentation using QMD - a local hybrid search engine. Combines BM25 keyword search, vector semantic search, and LLM re-ranking. Use when users ask to search notes, find documents, look up information in their knowledge base, retrieve meeting notes, or search documentation. Triggers on "search markdown files", "search my notes", "find in docs", "look up", "what did I write about", "meeting notes about".
-license: MIT
-compatibility: Requires qmd CLI or MCP server. Install via `bun install -g https://github.com/tobi/qmd`.
-metadata:
-  author: tobi
-  version: "1.1.1"
-allowed-tools: Bash(qmd:*), mcp__qmd__*
----
+# qmd - Quick Markdown Search
 
-# QMD - Quick Markdown Search
+Fast search for memory files and notes. Supports BM25 keyword search AND vector similarity via Gemini embeddings.
 
-QMD is a local, on-device search engine for markdown content. It indexes your notes, meeting transcripts, documentation, and knowledge bases for fast retrieval.
+## ⚠️ IMPORTANT: Use qmd-gemini Fork
 
-## QMD Status
-
-!`qmd status 2>/dev/null || echo "Not installed. Run: bun install -g https://github.com/tobi/qmd"`
-
-## When to Use This Skill
-
-- User asks to search their notes, documents, or knowledge base
-- User needs to find information in their markdown files
-- User wants to retrieve specific documents or search across collections
-- User asks "what did I write about X" or "find my notes on Y"
-- User needs semantic search (conceptual similarity) not just keyword matching
-- User mentions meeting notes, transcripts, or documentation lookup
-
-## Search Commands
-
-Choose the right search mode for the task:
-
-| Command | Use When | Speed |
-|---------|----------|-------|
-| `qmd search` | Exact keyword matches needed | Fast |
-| `qmd vsearch` | Keywords aren't working, need conceptual matches | Medium |
-| `qmd query` | Best results needed, speed not critical | Slower |
+**DO NOT use the global `qmd` command.** Use the Gemini fork:
 
 ```bash
-# Fast keyword search (BM25)
-qmd search "your query"
-
-# Semantic vector search (finds conceptually similar content)
-qmd vsearch "your query"
-
-# Hybrid search with re-ranking (best quality)
-qmd query "your query"
+# Always run from the fork with GEMINI_API_KEY
+cd ~/openai-demo/qmd-gemini
+GEMINI_API_KEY=$(cat ~/KeyApis/Gemini_121725.txt | tr -d '\n\r') ./qmd <command>
 ```
 
-## Common Options
+**Why:** The fork uses Gemini API for embeddings. No local models. No accidental 1.3GB downloads that will kill the MacBook.
+
+## When to Use
+
+**Use `qmd search` (BM25) when:**
+- Looking for specific names, dates, projects, or terms
+- Keywords are likely in the text exactly
+- Fast keyword matching
+
+**Use `qmd vsearch` (vector) when:**
+- Semantic/fuzzy queries ("conversations about changing our approach")
+- Finding related content even if exact keywords don't match
+- Questions phrased naturally
+
+**Fall back to `memory_search` only if:**
+- qmd returns nothing useful (rare)
+
+## Collections
+
+Two collections are indexed:
+- `clawdbot-memory` — `memory/**/*.md` (daily notes, transcripts, todos)
+- `clawdbot-root` — `*.md` in workspace root (MEMORY.md, USER.md, TOOLS.md, etc.)
+
+## Commands
 
 ```bash
--n <num>                 # Number of results (default: 5)
--c, --collection <name>  # Restrict to specific collection
---all                    # Return all matches
---min-score <num>        # Minimum score threshold (0.0-1.0)
---full                   # Show full document content
---json                   # JSON output for processing
---files                  # List files with scores
---line-numbers           # Add line numbers to output
+# Set the key (or inline it)
+export GEMINI_API_KEY=$(cat ~/KeyApis/Gemini_121725.txt | tr -d '\n\r')
+cd ~/openai-demo/qmd-gemini
+
+# BM25 keyword search
+./qmd search "query"
+./qmd search "query" -c clawdbot-memory -n 10
+
+# Vector similarity search (uses Gemini embeddings)
+./qmd vsearch "query"
+./qmd vsearch "what clients does mike work with" -n 5
+
+# Get full document by path or docid
+./qmd get "memory/2026-02-06.md"
+./qmd get "#abc123"
+./qmd get "memory/2026-02-06.md:50" -l 100
 ```
 
-## Document Retrieval
+## Initial Setup (One-Time)
+
+If embeddings haven't been generated yet:
 
 ```bash
-# Get document by path
-qmd get "collection/path/to/doc.md"
-
-# Get document by docid (shown in search results as #abc123)
-qmd get "#abc123"
-
-# Get with line numbers for code review
-qmd get "docs/api.md" --line-numbers
-
-# Get multiple documents by glob pattern
-qmd multi-get "docs/*.md"
-
-# Get multiple documents by list
-qmd multi-get "doc1.md, doc2.md, #abc123"
+cd ~/openai-demo/qmd-gemini
+GEMINI_API_KEY=$(cat ~/KeyApis/Gemini_121725.txt | tr -d '\n\r') ./qmd embed
 ```
 
-## Index Management
+This embeds all documents via Gemini API (~5 seconds for 50 docs). Run `qmd status` to check.
+
+## How It Works
+
+1. **`qmd embed`** — Chunks documents, generates embeddings via Gemini API (gemini-embedding-001)
+2. **`qmd vsearch`** — Embeds your query via Gemini, does vector similarity, returns top N results
+3. **No local LLM** — No query expansion, no reranking, no model downloads
+4. **You rank results** — Returns top matches, you (the LLM) rank them with context
+
+## Output
+
+Results show:
+- File path and line number
+- Document ID (use with `qmd get #id`)
+- Score (higher = better match)
+- Snippet with context
+
+## Examples
 
 ```bash
-# Check index status and available collections
-qmd status
+# Find references to a person
+./qmd search "Corey Hammond"
 
-# List all collections
-qmd collection list
+# Semantic search for client work
+./qmd vsearch "OnBreeze clients and projects"
 
-# List files in a collection
-qmd ls <collection-name>
+# Find decisions or preferences
+./qmd vsearch "what does mike prefer for design"
 
-# Update index (re-scan files for changes)
-qmd update
+# Search today's activity
+./qmd search "2026-02-06" -c clawdbot-memory
 ```
 
-## Score Interpretation
-
-| Score | Meaning | Action |
-|-------|---------|--------|
-| 0.8 - 1.0 | Highly relevant | Show to user |
-| 0.5 - 0.8 | Moderately relevant | Include if few results |
-| 0.2 - 0.5 | Somewhat relevant | Only if user wants more |
-| 0.0 - 0.2 | Low relevance | Usually skip |
-
-## Recommended Workflow
-
-1. **Check what's available**: `qmd status`
-2. **Start with keyword search**: `qmd search "topic" -n 10`
-3. **Try semantic if needed**: `qmd vsearch "describe the concept"`
-4. **Use hybrid for best results**: `qmd query "question" --min-score 0.4`
-5. **Retrieve full documents**: `qmd get "#docid" --full`
-
-## Example: Finding Meeting Notes
+## Index Maintenance
 
 ```bash
-# Search for meetings about a topic
-qmd search "quarterly review" -c meetings -n 5
+# Re-index all collections (after adding new files)
+./qmd update
 
-# Get semantic matches
-qmd vsearch "performance discussion" -c meetings
+# Re-generate embeddings (if needed)
+./qmd embed
 
-# Retrieve the full meeting notes
-qmd get "#abc123" --full
+# Check status
+./qmd status
 ```
 
-## Example: Research Across All Notes
+## Key Points
 
-```bash
-# Hybrid search for best results
-qmd query "authentication implementation" --min-score 0.3 --json
-
-# Get all relevant files for deeper analysis
-qmd query "auth flow" --all --files --min-score 0.4
-```
-
-## MCP Server Integration
-
-This plugin configures the qmd MCP server automatically. When available, prefer MCP tools over Bash for tighter integration:
-
-| MCP Tool | Equivalent CLI | Purpose |
-|----------|---------------|---------|
-| `qmd_search` | `qmd search` | Fast BM25 keyword search |
-| `qmd_vsearch` | `qmd vsearch` | Semantic vector search |
-| `qmd_query` | `qmd query` | Hybrid search with reranking |
-| `qmd_get` | `qmd get` | Retrieve document by path or docid |
-| `qmd_multi_get` | `qmd multi-get` | Retrieve multiple documents |
-| `qmd_status` | `qmd status` | Index health and collection info |
-
-For manual MCP setup without the plugin, see [references/mcp-setup.md](references/mcp-setup.md).
+- **Always use `~/openai-demo/qmd-gemini`** — not the global qmd
+- **Always set GEMINI_API_KEY** — from `~/KeyApis/Gemini_121725.txt`
+- **No local models** — Gemini API only, no downloads
+- **vsearch > memory_search** — faster, better results for most queries
