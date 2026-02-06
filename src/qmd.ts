@@ -2095,13 +2095,9 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   // Check index health and warn about issues
   checkIndexHealth(db);
 
-  // Auto-detect if Gemini embeddings are used
-  const storedModel = detectEmbeddingModel(db);
-  const useGemini = storedModel?.startsWith("gemini") || false;
-
-  // When Gemini embeddings detected (or --raw flag): skip local LLM entirely
-  // Just do pure vector similarity search - let the calling LLM rank results
-  if (opts.raw || useGemini) {
+  // ALWAYS use pure vector search - no local LLM ever
+  // Gemini API for embeddings, let calling LLM rank results
+  if (true) {
     const perQueryLimit = opts.all ? 500 : (opts.limit || 5);
     const results = await searchVec(db, query, model, perQueryLimit, collectionName);
     
@@ -2527,7 +2523,7 @@ function showHelp(): void {
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
   console.log("  qmd status                    - Show index status and collections");
   console.log("  qmd update [--pull]           - Re-index all collections (--pull: git pull first)");
-  console.log("  qmd embed [-f] [--provider local|gemini]  - Create vector embeddings");
+  console.log("  qmd embed [-f]                - Create vector embeddings (uses Gemini API)");
   console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
   console.log("  qmd search <query>            - Full-text search (BM25)");
   console.log("  qmd vsearch <query> [--raw]   - Vector similarity search (--raw: skip LLM expansion)");
@@ -2556,7 +2552,7 @@ function showHelp(): void {
   console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
   console.log("");
   console.log("Embedding providers:");
-  console.log("  --provider local   - Use local GGUF models (default)");
+  console.log("  --provider local   - Use local GGUF models (not recommended)");
   console.log("  --provider gemini  - Use Google Gemini API (requires GEMINI_API_KEY env var)");
   console.log("");
   console.log("Local models (auto-downloaded from HuggingFace):");
@@ -2747,7 +2743,7 @@ if (import.meta.main) {
       break;
 
     case "embed": {
-      const provider = (cli.values.provider as string) || "local";
+      const provider = (cli.values.provider as string) || "gemini";
       if (provider !== "local" && provider !== "gemini") {
         console.error(`Unknown provider: ${provider}`);
         console.error("Available providers: local, gemini");
