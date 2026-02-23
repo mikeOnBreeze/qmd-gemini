@@ -27,12 +27,12 @@ import {
   insertDocument,
   insertContent,
   insertEmbedding,
-  chunkDocumentByTokens,
+  chunkDocument,
   reciprocalRankFusion,
   DEFAULT_EMBED_MODEL,
   type RankedResult,
 } from "./store";
-import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "./llm";
+import { formatDocForEmbedding } from "./llm";
 
 // Eval queries with expected documents
 const evalQueries: {
@@ -174,9 +174,15 @@ describe("Vector Search", () => {
       }
     }
 
-    // Generate embeddings for test documents
-    const llm = getDefaultLlamaCpp();
-    store.ensureVecTable(768); // embeddinggemma uses 768 dimensions
+    // Generate embeddings for test documents using Gemini API
+    if (!process.env.GEMINI_API_KEY) {
+      console.log("GEMINI_API_KEY not set, skipping vector embedding generation");
+      return;
+    }
+
+    const { GeminiEmbedder } = await import("./llm-gemini");
+    const embedder = new GeminiEmbedder(process.env.GEMINI_API_KEY);
+    store.ensureVecTable(768); // gemini-embedding-001 with 768 dimensions
 
     const evalDocsDir = join(import.meta.dir, "../test/eval-docs");
     const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
@@ -186,13 +192,13 @@ describe("Vector Search", () => {
       const hash = Bun.hash(content).toString(16).slice(0, 12);
       const title = content.split("\n")[0]?.replace(/^#\s*/, "") || file;
 
-      // Chunk and embed
-      const chunks = await chunkDocumentByTokens(content);
+      // Chunk and embed using character-based chunking
+      const chunks = chunkDocument(content);
       for (let seq = 0; seq < chunks.length; seq++) {
         const chunk = chunks[seq];
         if (!chunk) continue;
         const formatted = formatDocForEmbedding(chunk.text, title);
-        const result = await llm.embed(formatted, { model: DEFAULT_EMBED_MODEL, isQuery: false });
+        const result = await embedder.embed(formatted, false);
         if (result?.embedding) {
           // Convert to Float32Array for sqlite-vec
           const embedding = new Float32Array(result.embedding);
@@ -406,7 +412,5 @@ describe("Hybrid Search (RRF)", () => {
 // =============================================================================
 
 afterAll(async () => {
-  // Ensure native resources are released to avoid ggml-metal asserts on process exit.
-  await disposeDefaultLlamaCpp();
   rmSync(tempDir, { recursive: true, force: true });
 });

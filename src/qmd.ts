@@ -33,7 +33,6 @@ import {
   formatDocForEmbedding,
   formatQueryForEmbedding,
   chunkDocument,
-  chunkDocumentByTokens,
   clearCache,
   getCacheKey,
   getCachedResult,
@@ -61,22 +60,18 @@ import {
   handelize,
   detectEmbeddingModel,
   DEFAULT_EMBED_MODEL,
-  DEFAULT_QUERY_MODEL,
-  DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
 import { GeminiEmbedder, createGeminiEmbedder, GEMINI_DEFAULT_DIMENSIONS, GEMINI_DEFAULT_MODEL } from "./llm-gemini.js";
 import { ZeppelinVectorStore, getZeppelinStore, ZeppelinError } from "./vector-store-zeppelin.js";
 
 // =============================================================================
-// Embedding Provider Types
+// Types
 // =============================================================================
 
-export type EmbedProvider = "local" | "gemini";
 export type VectorStoreType = "sqlite" | "zeppelin";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
@@ -243,28 +238,6 @@ function computeDisplayPath(
   return filepath;
 }
 
-// Rerank documents using node-llama-cpp cross-encoder model
-async function rerank(query: string, documents: { file: string; text: string }[], _model: string = DEFAULT_RERANK_MODEL, _db?: Database, session?: ILLMSession): Promise<{ file: string; score: number }[]> {
-  if (documents.length === 0) return [];
-
-  const total = documents.length;
-  process.stderr.write(`Reranking ${total} documents...\n`);
-  progress.indeterminate();
-
-  const rerankDocs: RerankDocument[] = documents.map((doc) => ({
-    file: doc.file,
-    text: doc.text.slice(0, 4000), // Truncate to context limit
-  }));
-
-  const result = session
-    ? await session.rerank(query, rerankDocs)
-    : await getDefaultLlamaCpp().rerank(query, rerankDocs);
-
-  progress.clear();
-  process.stderr.write("\n");
-
-  return result.results.map((r) => ({ file: r.file, score: r.score }));
-}
 
 function formatTimeAgo(date: Date): string {
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
@@ -1500,7 +1473,7 @@ function renderProgressBar(percent: number, width: number = 30): string {
   return bar;
 }
 
-async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false, provider: EmbedProvider = "local", vectorStore: VectorStoreType = "sqlite"): Promise<void> {
+async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false, vectorStore: VectorStoreType = "sqlite"): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
 
@@ -1558,10 +1531,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     const title = extractTitle(item.body, item.path);
     const displayName = item.path;
 
-    // Use token-based chunking for local, char-based for Gemini
-    const chunks = provider === "gemini"
-      ? chunkDocument(item.body).map(c => ({ ...c, tokens: Math.ceil(c.text.length / 4) }))
-      : await chunkDocumentByTokens(item.body);
+    const chunks = chunkDocument(item.body).map(c => ({ ...c, tokens: Math.ceil(c.text.length / 4) }));
 
     if (chunks.length > 1) multiChunkDocs++;
 
@@ -1590,17 +1560,17 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   const totalDocs = hashesToEmbed.length;
 
   // Determine model name to display
-  const displayModel = provider === "gemini" ? GEMINI_DEFAULT_MODEL : model;
+  const displayModel = GEMINI_DEFAULT_MODEL;
   console.log(`${c.bold}Embedding ${totalDocs} documents${c.reset} ${c.dim}(${totalChunks} chunks, ${formatBytes(totalBytes)})${c.reset}`);
   if (multiChunkDocs > 0) {
     console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
   }
-  console.log(`${c.dim}Provider: ${provider}, Model: ${displayModel}, Store: ${vectorStore}${c.reset}\n`);
+  console.log(`${c.dim}Model: ${displayModel}, Store: ${vectorStore}${c.reset}\n`);
 
   // Hide cursor during embedding
   cursor.hide();
 
-  if (provider === "gemini") {
+  {
     // Use Gemini embedder
     let geminiEmbedder: GeminiEmbedder;
     try {
@@ -1739,149 +1709,6 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       console.log(`${c.dim}Stored in Zeppelin at ${process.env.ZEPPELIN_URL || "http://localhost:8080"}${c.reset}`);
     }
 
-  } else {
-    // Use local LLM embedder (original code path)
-    // Wrap all LLM embedding operations in a session for lifecycle management
-    // Use 30 minute timeout for large collections
-    await withLLMSession(async (session) => {
-      // Get embedding dimensions from first chunk
-      progress.indeterminate();
-      const firstChunk = allChunks[0];
-      if (!firstChunk) {
-        throw new Error("No chunks available to embed");
-      }
-      const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-      const firstResult = await session.embed(firstText);
-      if (!firstResult) {
-        throw new Error("Failed to get embedding dimensions from first chunk");
-      }
-      const localEmbDims = firstResult.embedding.length;
-      if (vectorStore === "zeppelin" && zeppelin) {
-        await zeppelin.ensureNamespace(localEmbDims);
-      } else {
-        ensureVecTable(db, localEmbDims);
-      }
-
-      // Zeppelin batch buffer for local LLM path
-      const localZeppelinBuffer: Array<{
-        hash: string; seq: number; pos: number;
-        embedding: number[] | Float32Array;
-        collection?: string; path?: string; title?: string; model: string;
-      }> = [];
-
-      let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
-      const startTime = Date.now();
-
-      // Batch embedding for better throughput
-      // Process in batches of 32 to balance memory usage and efficiency
-      const BATCH_SIZE = 32;
-
-      for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
-        const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
-        const batch = allChunks.slice(batchStart, batchEnd);
-
-        // Format texts for embedding
-        const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
-
-        try {
-          // Batch embed all texts at once
-          const embeddings = await session.embedBatch(texts);
-
-          // Insert each embedding
-          for (let i = 0; i < batch.length; i++) {
-            const chunk = batch[i]!;
-            const embedding = embeddings[i];
-
-            if (embedding) {
-              if (vectorStore === "zeppelin") {
-                localZeppelinBuffer.push({
-                  hash: chunk.hash, seq: chunk.seq, pos: chunk.pos,
-                  embedding: embedding.embedding,
-                  path: chunk.displayName, title: chunk.title,
-                  model,
-                });
-              } else {
-                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
-              }
-              chunksEmbedded++;
-            } else {
-              errors++;
-              console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}${c.reset}`);
-            }
-            bytesProcessed += chunk.bytes;
-          }
-        } catch (err) {
-          // If batch fails, try individual embeddings as fallback
-          for (const chunk of batch) {
-            try {
-              const text = formatDocForEmbedding(chunk.text, chunk.title);
-              const result = await session.embed(text);
-              if (result) {
-                if (vectorStore === "zeppelin") {
-                  localZeppelinBuffer.push({
-                    hash: chunk.hash, seq: chunk.seq, pos: chunk.pos,
-                    embedding: result.embedding,
-                    path: chunk.displayName, title: chunk.title,
-                    model,
-                  });
-                } else {
-                  insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
-                }
-                chunksEmbedded++;
-              } else {
-                errors++;
-              }
-            } catch (innerErr) {
-              errors++;
-              console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}: ${innerErr}${c.reset}`);
-            }
-            bytesProcessed += chunk.bytes;
-          }
-        }
-
-        // Flush Zeppelin buffer periodically
-        if (vectorStore === "zeppelin" && zeppelin && localZeppelinBuffer.length >= 200) {
-          await zeppelin.upsertEmbeddingBatch(localZeppelinBuffer);
-          localZeppelinBuffer.length = 0;
-        }
-
-        const percent = (bytesProcessed / totalBytes) * 100;
-        progress.set(percent);
-
-        const elapsed = (Date.now() - startTime) / 1000;
-        const bytesPerSec = bytesProcessed / elapsed;
-        const remainingBytes = totalBytes - bytesProcessed;
-        const etaSec = remainingBytes / bytesPerSec;
-
-        const bar = renderProgressBar(percent);
-        const percentStr = percent.toFixed(0).padStart(3);
-        const throughput = `${formatBytes(bytesPerSec)}/s`;
-        const eta = elapsed > 2 ? formatETA(etaSec) : "...";
-        const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
-
-        process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
-      }
-
-      // Flush remaining Zeppelin buffer
-      if (vectorStore === "zeppelin" && zeppelin && localZeppelinBuffer.length > 0) {
-        await zeppelin.upsertEmbeddingBatch(localZeppelinBuffer);
-        localZeppelinBuffer.length = 0;
-      }
-
-      progress.clear();
-      cursor.show();
-      const totalTimeSec = (Date.now() - startTime) / 1000;
-      const avgThroughput = formatBytes(totalBytes / totalTimeSec);
-
-      console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
-      console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
-      if (errors > 0) {
-        console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
-      }
-      if (vectorStore === "zeppelin") {
-        console.log(`${c.dim}Stored in Zeppelin at ${process.env.ZEPPELIN_URL || "http://localhost:8080"}${c.reset}`);
-      }
-    }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
   }
 
   closeDb();
@@ -2225,132 +2052,30 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   // Check index health and warn about issues
   checkIndexHealth(db);
 
-  // ALWAYS use pure vector search - no local LLM ever
-  // Gemini API for embeddings, let calling LLM rank results
-  if (true) {
-    const perQueryLimit = opts.all ? 500 : (opts.limit || 5);
+  const perQueryLimit = opts.all ? 500 : (opts.limit || 5);
 
-    let results: Awaited<ReturnType<typeof searchVec>>;
-    if (useZeppelin) {
-      results = await searchVecZeppelin(db, getZeppelinStore(), query, model, perQueryLimit, collectionName);
-    } else {
-      results = await searchVec(db, query, model, perQueryLimit, collectionName);
-    }
-    
-    // Map to the format outputResults expects
-    const mapped = results.map(r => ({
-      file: r.filepath,
-      displayPath: r.displayPath,
-      title: r.title,
-      body: r.body || "",
-      score: r.score,
-      hash: r.hash,
-    }));
-    
-    outputResults(mapped, query, opts);
-    closeDb();
-    return;
+  let results: Awaited<ReturnType<typeof searchVec>>;
+  if (useZeppelin) {
+    results = await searchVecZeppelin(db, getZeppelinStore(), query, model, perQueryLimit, collectionName);
+  } else {
+    results = await searchVec(db, query, model, perQueryLimit, collectionName);
   }
 
-  // Wrap LLM operations in a session for lifecycle management
-  await withLLMSession(async (session) => {
-    // Expand query using structured output (no lexical for vector-only search)
-    const queryables = await expandQueryStructured(query, false, opts.context, session);
+  // Map to the format outputResults expects
+  const mapped = results.map(r => ({
+    file: r.filepath,
+    displayPath: r.displayPath,
+    title: r.title,
+    body: r.body || "",
+    score: r.score,
+    hash: r.hash,
+  }));
 
-    // Build list of queries for vector search: original, vec, and hyde
-    const vectorQueries: string[] = [query];
-    for (const q of queryables) {
-      if (q.type === 'vec' || q.type === 'hyde') {
-        if (q.text && q.text !== query) {
-          vectorQueries.push(q.text);
-        }
-      }
-    }
-
-    process.stderr.write(`${c.dim}Searching ${vectorQueries.length} vector queries...${c.reset}\n`);
-
-    // Collect results from all query variations
-    const perQueryLimit = opts.all ? 500 : 20;
-    const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; hash: string }>();
-
-    // IMPORTANT: Run vector searches sequentially, not with Promise.all.
-    // node-llama-cpp's embedding context hangs when multiple concurrent embed() calls
-    // are made. This is a known limitation of the LlamaEmbeddingContext.
-    // See: https://github.com/tobi/qmd/pull/23
-    for (const q of vectorQueries) {
-      const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any, session);
-      for (const r of vecResults) {
-        const existing = allResults.get(r.filepath);
-        if (!existing || r.score > existing.score) {
-          allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, hash: r.hash });
-        }
-      }
-    }
-
-    // Sort by max score and limit to requested count
-    const results = Array.from(allResults.values())
-      .sort((a, b) => b.score - a.score)
-      .slice(0, opts.limit)
-      .map(r => ({ ...r, context: getContextForFile(db, r.file) }));
-
-    closeDb();
-
-    if (results.length === 0) {
-      console.log("No results found.");
-      return;
-    }
-    outputResults(results, query, { ...opts, limit: results.length }); // Already limited
-  }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+  outputResults(mapped, query, opts);
+  closeDb();
 }
 
-// Expand query using structured output with GBNF grammar
-async function expandQueryStructured(query: string, includeLexical: boolean = true, context?: string, session?: ILLMSession): Promise<Queryable[]> {
-  process.stderr.write(`${c.dim}Expanding query...${c.reset}\n`);
-
-  const queryables = session
-    ? await session.expandQuery(query, { includeLexical, context })
-    : await getDefaultLlamaCpp().expandQuery(query, { includeLexical, context });
-
-  // Log the expansion as a tree
-  const lines: string[] = [];
-  const bothLabel = includeLexical ? ' · (lexical+vector)' : ' · (vector)';
-  lines.push(`${c.dim}├─ ${query}${bothLabel}${c.reset}`);
-
-  for (let i = 0; i < queryables.length; i++) {
-    const q = queryables[i];
-    if (!q || q.text === query) continue;
-
-    let textPreview = q.text.replace(/\n/g, ' ');
-    if (textPreview.length > 80) {
-      textPreview = textPreview.substring(0, 77) + '...';
-    }
-
-    const label = q.type === 'lex' ? 'lexical' : (q.type === 'hyde' ? 'hyde' : 'vector');
-    lines.push(`${c.dim}├─ ${textPreview} · (${label})${c.reset}`);
-  }
-
-  // Fix last item to use └─ instead of ├─
-  if (lines.length > 0) {
-    lines[lines.length - 1] = lines[lines.length - 1]!.replace('├─', '└─');
-  }
-
-  for (const line of lines) {
-    process.stderr.write(line + '\n');
-  }
-
-  return queryables;
-}
-
-async function expandQuery(query: string, _model: string = DEFAULT_QUERY_MODEL, _db?: Database, session?: ILLMSession): Promise<string[]> {
-  const queryables = await expandQueryStructured(query, true, undefined, session);
-  const queries = new Set<string>([query]);
-  for (const q of queryables) {
-    queries.add(q.text);
-  }
-  return Array.from(queries);
-}
-
-async function querySearch(query: string, opts: OutputOptions, embedModel: string = DEFAULT_EMBED_MODEL, rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
+async function querySearch(query: string, opts: OutputOptions, embedModel: string = DEFAULT_EMBED_MODEL): Promise<void> {
   const db = getDb();
 
   // Validate collection filter if specified
@@ -2368,196 +2093,49 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   // Check index health and warn about issues
   checkIndexHealth(db);
 
-  // Run initial BM25 search (will be reused for retrieval)
-  const initialFts = searchFTS(db, query, 20, collectionName as any);
   const useZeppelin = opts.store === "zeppelin";
-  let hasVectors = useZeppelin || !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  const hasVectors = useZeppelin || !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
-  // Check if initial results have strong signals (skip expansion if so)
-  // Strong signal = top result is strong AND clearly separated from runner-up.
-  // This avoids skipping expansion when BM25 has lots of mediocre matches.
-  const topScore = initialFts[0]?.score ?? 0;
-  const secondScore = initialFts[1]?.score ?? 0;
-  const hasStrongSignal = initialFts.length > 0 && topScore >= 0.85 && (topScore - secondScore) >= 0.15;
+  // Collect ranked result lists for RRF fusion
+  const rankedLists: RankedResult[][] = [];
+  const hashMap = new Map<string, string>();
 
-  // Wrap LLM operations in a session for lifecycle management
-  await withLLMSession(async (session) => {
-    let ftsQueries: string[] = [query];
-    let vectorQueries: string[] = [query];
+  // BM25 search
+  const ftsResults = searchFTS(db, query, 20, (collectionName || "") as any);
+  if (ftsResults.length > 0) {
+    for (const r of ftsResults) hashMap.set(r.filepath, r.hash);
+    rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+  }
 
-    if (hasStrongSignal) {
-      // Strong BM25 signal - skip expensive LLM expansion
-      process.stderr.write(`${c.dim}Strong BM25 signal (${topScore.toFixed(2)}) - skipping expansion${c.reset}\n`);
-      // Still log the "expansion tree" in the same style as vsearch for consistency.
-      {
-        const lines: string[] = [];
-        lines.push(`${c.dim}├─ ${query} · (lexical+vector)${c.reset}`);
-        lines[lines.length - 1] = lines[lines.length - 1]!.replace('├─', '└─');
-        for (const line of lines) process.stderr.write(line + '\n');
-      }
-    } else {
-      // Weak signal - expand query for better recall
-      const queryables = await expandQueryStructured(query, true, opts.context, session);
-
-      for (const q of queryables) {
-        if (q.type === 'lex') {
-          if (q.text && q.text !== query) ftsQueries.push(q.text);
-        } else if (q.type === 'vec' || q.type === 'hyde') {
-          if (q.text && q.text !== query) vectorQueries.push(q.text);
-        }
-      }
+  // Vector search
+  if (hasVectors) {
+    const vecResults = useZeppelin
+      ? await searchVecZeppelin(db, getZeppelinStore(), query, embedModel, 20, (collectionName || "") as any)
+      : await searchVec(db, query, embedModel, 20, (collectionName || "") as any);
+    if (vecResults.length > 0) {
+      for (const r of vecResults) hashMap.set(r.filepath, r.hash);
+      rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
     }
+  }
 
-    process.stderr.write(`${c.dim}Searching ${ftsQueries.length} lexical + ${vectorQueries.length} vector queries...${c.reset}\n`);
-
-    // Collect ranked result lists for RRF fusion
-    const rankedLists: RankedResult[][] = [];
-
-    // Map to store hash by filepath for final results
-    const hashMap = new Map<string, string>();
-
-    // Run all searches concurrently (FTS + Vector)
-    const searchPromises: Promise<void>[] = [];
-
-    // FTS searches
-    for (const q of ftsQueries) {
-      if (!q) continue;
-      searchPromises.push((async () => {
-        const ftsResults = searchFTS(db, q, 20, (collectionName || "") as any);
-        if (ftsResults.length > 0) {
-          for (const r of ftsResults) {
-            // Mutex for hashMap is not strictly needed as it's just adding values
-            hashMap.set(r.filepath, r.hash);
-          }
-          rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-        }
-      })());
-    }
-
-    // Vector searches (session ensures contexts stay alive)
-    if (hasVectors) {
-      for (const q of vectorQueries) {
-        if (!q) continue;
-        searchPromises.push((async () => {
-          const vecResults = useZeppelin
-            ? await searchVecZeppelin(db, getZeppelinStore(), q, embedModel, 20, (collectionName || "") as any, session)
-            : await searchVec(db, q, embedModel, 20, (collectionName || "") as any, session);
-          if (vecResults.length > 0) {
-            for (const r of vecResults) hashMap.set(r.filepath, r.hash);
-            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-          }
-        })());
-      }
-    }
-
-    await Promise.all(searchPromises);
-
-    // Apply Reciprocal Rank Fusion to combine all ranked lists
-    // Give 2x weight to original query results (first 2 lists: FTS + vector)
-    const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
-    const fused = reciprocalRankFusion(rankedLists, weights);
-    // Hard cap reranking for latency/cost. We rerank per-document (best chunk only).
-    const RERANK_DOC_LIMIT = 40;
-    const candidates = fused.slice(0, RERANK_DOC_LIMIT);
-
-    if (candidates.length === 0) {
-      console.log("No results found.");
-      closeDb();
-      return;
-    }
-
-    // Rerank multiple chunks per document, then aggregate scores
-    // This improves ranking for long documents where keyword-matched chunk isn't always best
-    // We only rerank ONE chunk per document (best chunk by a simple keyword heuristic),
-    // so we never rerank more than RERANK_DOC_LIMIT items.
-    const chunksToRerank: { file: string; text: string; chunkIdx: number }[] = [];
-    const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
-
-    const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-    for (const cand of candidates) {
-      const chunks = chunkDocument(cand.body);
-      if (chunks.length === 0) continue;
-
-      // Choose best chunk by keyword matches; fall back to first chunk.
-      let bestIdx = 0;
-      let bestScore = -1;
-      for (let i = 0; i < chunks.length; i++) {
-        const chunkLower = chunks[i]!.text.toLowerCase();
-        const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-        if (score > bestScore) {
-          bestScore = score;
-          bestIdx = i;
-        }
-      }
-
-      chunksToRerank.push({ file: cand.file, text: chunks[bestIdx]!.text, chunkIdx: bestIdx });
-      docChunkMap.set(cand.file, { chunks, bestIdx });
-    }
-
-    // Rerank selected chunks (with caching). One chunk per doc -> one rerank item per doc.
-    const reranked = await rerank(
-      query,
-      chunksToRerank.map(ch => ({ file: ch.file, text: ch.text })),
-      rerankModel,
-      db,
-      session
-    );
-
-    const aggregatedScores = new Map<string, { score: number; bestChunkIdx: number }>();
-    for (const r of reranked) {
-      const chunkInfo = docChunkMap.get(r.file);
-      aggregatedScores.set(r.file, { score: r.score, bestChunkIdx: chunkInfo?.bestIdx ?? 0 });
-    }
-
-    // Blend RRF position score with aggregated reranker score using position-aware weights
-    // Top retrieval results get more protection from reranker disagreement
-    const candidateMap = new Map(candidates.map(cand => [cand.file, { displayPath: cand.displayPath, title: cand.title, body: cand.body }]));
-    const rrfRankMap = new Map(candidates.map((cand, i) => [cand.file, i + 1])); // 1-indexed rank
-
-    const finalResults = Array.from(aggregatedScores.entries()).map(([file, { score: rerankScore, bestChunkIdx }]) => {
-      const rrfRank = rrfRankMap.get(file) || 30;
-      // Position-aware blending: top retrieval results preserved more
-      // Rank 1-3: 75% RRF, 25% reranker (trust retrieval for exact matches)
-      // Rank 4-10: 60% RRF, 40% reranker
-      // Rank 11+: 40% RRF, 60% reranker (trust reranker for lower-ranked)
-      let rrfWeight: number;
-      if (rrfRank <= 3) {
-        rrfWeight = 0.75;
-      } else if (rrfRank <= 10) {
-        rrfWeight = 0.60;
-      } else {
-        rrfWeight = 0.40;
-      }
-      const rrfScore = 1 / rrfRank;  // Position-based: 1, 0.5, 0.33...
-      const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * rerankScore;
-      const candidate = candidateMap.get(file);
-      // Use the best-scoring chunk's text for the body (better for snippets)
-      const chunkInfo = docChunkMap.get(file);
-      const chunkBody = chunkInfo ? (chunkInfo.chunks[bestChunkIdx]?.text || chunkInfo.chunks[0]!.text) : candidate?.body || "";
-      const chunkPos = chunkInfo ? (chunkInfo.chunks[bestChunkIdx]?.pos || 0) : 0;
-      return {
-        file,
-        displayPath: candidate?.displayPath || "",
-        title: candidate?.title || "",
-        body: chunkBody,
-        chunkPos,
-        score: blendedScore,
-        context: getContextForFile(db, file),
-        hash: hashMap.get(file) || "",
-      };
-    }).sort((a, b) => b.score - a.score);
-
-    // Deduplicate by file (safety net - shouldn't happen but prevents duplicate output)
-    const seenFiles = new Set<string>();
-    const dedupedResults = finalResults.filter(r => {
-      if (seenFiles.has(r.file)) return false;
-      seenFiles.add(r.file);
-      return true;
-    });
-
+  if (rankedLists.length === 0) {
+    console.log("No results found.");
     closeDb();
-    outputResults(dedupedResults, query, opts);
-  }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+    return;
+  }
+
+  // Apply Reciprocal Rank Fusion to combine BM25 + vector results
+  const weights = rankedLists.map(() => 1.0);
+  const fused = reciprocalRankFusion(rankedLists, weights);
+
+  const results = fused.slice(0, opts.limit).map(r => ({
+    ...r,
+    hash: hashMap.get(r.file) || "",
+    context: getContextForFile(db, r.file),
+  }));
+
+  closeDb();
+  outputResults(results, query, opts);
 }
 
 // Parse CLI arguments using util.parseArgs
@@ -2592,7 +2170,6 @@ function parseCLI() {
       mask: { type: "string" },  // glob pattern
       // Embed options
       force: { type: "boolean", short: "f" },
-      provider: { type: "string", short: "p" },  // "local" or "gemini"
       store: { type: "string", short: "s" },  // "sqlite" or "zeppelin"
       // Update options
       pull: { type: "boolean" },  // git pull before update
@@ -2692,20 +2269,11 @@ function showHelp(): void {
   console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
   console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
   console.log("");
-  console.log("Embedding providers:");
-  console.log("  --provider local   - Use local GGUF models (not recommended)");
-  console.log("  --provider gemini  - Use Google Gemini API (requires GEMINI_API_KEY env var)");
-  console.log("");
   console.log("Vector storage backends:");
   console.log("  --store sqlite     - Local sqlite-vec storage (default)");
   console.log("  --store zeppelin   - Zeppelin vector search engine (requires running server)");
   console.log("");
-  console.log("Local models (auto-downloaded from HuggingFace):");
-  console.log("  Embedding: embeddinggemma-300M-Q8_0");
-  console.log("  Reranking: qwen3-reranker-0.6b-q8_0");
-  console.log("  Generation: Qwen3-0.6B-Q8_0");
-  console.log("");
-  console.log("Gemini model: gemini-embedding-001 (768 dimensions)");
+  console.log("Embedding model: Gemini gemini-embedding-001 (768 dimensions, requires GEMINI_API_KEY)");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
 }
@@ -2888,39 +2456,13 @@ if (import.meta.main) {
       break;
 
     case "embed": {
-      const provider = (cli.values.provider as string) || "gemini";
-      if (provider !== "local" && provider !== "gemini") {
-        console.error(`Unknown provider: ${provider}`);
-        console.error("Available providers: local, gemini");
-        process.exit(1);
-      }
       const vectorStore = (cli.values.store as string) || "sqlite";
       if (vectorStore !== "sqlite" && vectorStore !== "zeppelin") {
         console.error(`Unknown store: ${vectorStore}`);
         console.error("Available stores: sqlite, zeppelin");
         process.exit(1);
       }
-      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force, provider as EmbedProvider, vectorStore as VectorStoreType);
-      break;
-    }
-
-    case "pull": {
-      const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
-      const models = [
-        DEFAULT_EMBED_MODEL_URI,
-        DEFAULT_GENERATE_MODEL_URI,
-        DEFAULT_RERANK_MODEL_URI,
-      ];
-      console.log(`${c.bold}Pulling models${c.reset}`);
-      const results = await pullModels(models, {
-        refresh,
-        cacheDir: DEFAULT_MODEL_CACHE_DIR,
-      });
-      for (const result of results) {
-        const size = formatBytes(result.sizeBytes);
-        const note = result.refreshed ? "refreshed" : "cached/checked";
-        console.log(`- ${result.model} -> ${result.path} (${size}, ${note})`);
-      }
+      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force, vectorStore as VectorStoreType);
       break;
     }
 
@@ -2994,7 +2536,6 @@ if (import.meta.main) {
   }
 
   if (cli.command !== "mcp") {
-    await disposeDefaultLlamaCpp();
     process.exit(0);
   }
 

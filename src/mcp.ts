@@ -16,8 +16,6 @@ import {
   reciprocalRankFusion,
   extractSnippet,
   DEFAULT_EMBED_MODEL,
-  DEFAULT_QUERY_MODEL,
-  DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
 import type { RankedResult } from "./store.js";
@@ -317,24 +315,10 @@ You can also access documents directly via the \`qmd://\` URI scheme:
         };
       }
 
-      // Expand query
-      const queries = await store.expandQuery(query, DEFAULT_QUERY_MODEL);
+      const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit || 10);
+      const collectionFiltered = vecResults.filter(r => !collection || r.collectionName === collection);
 
-      // Collect results (filter by collection after search)
-      const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; docid: string }>();
-      for (const q of queries) {
-        const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit || 10)
-          .then(results => results.filter(r => !collection || r.collectionName === collection));
-        for (const r of vecResults) {
-          const existing = allResults.get(r.filepath);
-          if (!existing || r.score > existing.score) {
-            allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, docid: r.docid });
-          }
-        }
-      }
-
-      const filtered: SearchResultItem[] = Array.from(allResults.values())
-        .sort((a, b) => b.score - a.score)
+      const filtered: SearchResultItem[] = collectionFiltered
         .slice(0, limit || 10)
         .filter(r => r.score >= (minScore || 0.3))
         .map(r => {
@@ -344,7 +328,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
             file: r.displayPath,
             title: r.title,
             score: Math.round(r.score * 100) / 100,
-            context: store.getContextForFile(r.file),
+            context: store.getContextForFile(r.filepath),
             snippet: addLineNumbers(snippet, line),  // Default to line numbers
           };
         });
@@ -364,7 +348,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     "query",
     {
       title: "Hybrid Query (Best Quality)",
-      description: "Highest quality search combining BM25 + vector + query expansion + LLM reranking. Slower but most accurate. Use for important searches.",
+      description: "Highest quality search combining BM25 + vector similarity with Reciprocal Rank Fusion. Use for important searches.",
       inputSchema: {
         query: z.string().describe("Natural language query - describe what you're looking for"),
         limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
@@ -373,66 +357,46 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       },
     },
     async ({ query, limit, minScore, collection }) => {
-      // Expand query
-      const queries = await store.expandQuery(query, DEFAULT_QUERY_MODEL);
-
-      // Collect ranked lists (filter by collection after search)
       const rankedLists: RankedResult[][] = [];
-      const docidMap = new Map<string, string>(); // filepath -> docid
+      const docidMap = new Map<string, string>();
       const hasVectors = !!store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
-      for (const q of queries) {
-        const ftsResults = store.searchFTS(q, 20)
-          .filter(r => !collection || r.collectionName === collection);
-        if (ftsResults.length > 0) {
-          for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-        }
-        if (hasVectors) {
-          const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, 20)
-            .then(results => results.filter(r => !collection || r.collectionName === collection));
-          if (vecResults.length > 0) {
-            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-          }
+      // BM25 search
+      const ftsResults = store.searchFTS(query, 20)
+        .filter(r => !collection || r.collectionName === collection);
+      if (ftsResults.length > 0) {
+        for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
+        rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+      }
+
+      // Vector search
+      if (hasVectors) {
+        const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 20);
+        const collFiltered = vecResults.filter(r => !collection || r.collectionName === collection);
+        if (collFiltered.length > 0) {
+          for (const r of collFiltered) docidMap.set(r.filepath, r.docid);
+          rankedLists.push(collFiltered.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
         }
       }
 
       // RRF fusion
-      const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
+      const weights = rankedLists.map(() => 1.0);
       const fused = reciprocalRankFusion(rankedLists, weights);
-      const candidates = fused.slice(0, 30);
 
-      // Rerank
-      const reranked = await store.rerank(
-        query,
-        candidates.map(c => ({ file: c.file, text: c.body })),
-        DEFAULT_RERANK_MODEL
-      );
-
-      // Blend scores
-      const candidateMap = new Map(candidates.map(c => [c.file, { displayPath: c.displayPath, title: c.title, body: c.body }]));
-      const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
-
-      const filtered: SearchResultItem[] = reranked.map(r => {
-        const rrfRank = rrfRankMap.get(r.file) || candidates.length;
-        let rrfWeight: number;
-        if (rrfRank <= 3) rrfWeight = 0.75;
-        else if (rrfRank <= 10) rrfWeight = 0.60;
-        else rrfWeight = 0.40;
-        const rrfScore = 1 / rrfRank;
-        const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
-        const candidate = candidateMap.get(r.file);
-        const { line, snippet } = extractSnippet(candidate?.body || "", query, 300);
-        return {
-          docid: `#${docidMap.get(r.file) || ""}`,
-          file: candidate?.displayPath || "",
-          title: candidate?.title || "",
-          score: Math.round(blendedScore * 100) / 100,
-          context: store.getContextForFile(r.file),
-          snippet: addLineNumbers(snippet, line),  // Default to line numbers
-        };
-      }).filter(r => r.score >= (minScore || 0)).slice(0, limit || 10);
+      const filtered: SearchResultItem[] = fused
+        .slice(0, limit || 10)
+        .map(r => {
+          const { line, snippet } = extractSnippet(r.body || "", query, 300);
+          return {
+            docid: `#${docidMap.get(r.file) || ""}`,
+            file: r.displayPath || "",
+            title: r.title || "",
+            score: Math.round(r.score * 100) / 100,
+            context: store.getContextForFile(r.file),
+            snippet: addLineNumbers(snippet, line),
+          };
+        })
+        .filter(r => r.score >= (minScore || 0));
 
       return {
         content: [{ type: "text", text: formatSearchSummary(filtered, query) }],

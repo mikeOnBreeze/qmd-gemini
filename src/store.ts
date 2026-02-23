@@ -16,12 +16,9 @@ import { Glob } from "bun";
 import { realpathSync, statSync } from "node:fs";
 import * as sqliteVec from "sqlite-vec";
 import {
-  LlamaCpp,
-  getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   type RerankDocument,
-  type ILLMSession,
 } from "./llm";
 import { createGeminiEmbedder, GEMINI_DEFAULT_MODEL, type GeminiEmbedder } from "./llm-gemini";
 import { type ZeppelinVectorStore } from "./vector-store-zeppelin";
@@ -46,8 +43,7 @@ import {
 
 const HOME = Bun.env.HOME || "/tmp";
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
-export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
-export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
+// Local model constants removed - using Gemini API exclusively
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 
@@ -624,10 +620,6 @@ export type Store = {
   searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collectionName?: string) => Promise<SearchResult[]>;
 
-  // Query expansion & reranking
-  expandQuery: (query: string, model?: string) => Promise<string[]>;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string) => Promise<{ file: string; score: number }[]>;
-
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
   getDocumentBody: (doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number) => string | null;
@@ -706,10 +698,6 @@ export function createStore(dbPath?: string): Store {
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
     searchVec: (query: string, model: string, limit?: number, collectionName?: string) => searchVec(db, query, model, limit, collectionName),
-
-    // Query expansion & reranking
-    expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string) => rerank(query, documents, model, db),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -1246,77 +1234,7 @@ export function chunkDocument(content: string, maxChars: number = CHUNK_SIZE_CHA
  * Chunk a document by actual token count using the LLM tokenizer.
  * More accurate than character-based chunking but requires async.
  */
-export async function chunkDocumentByTokens(
-  content: string,
-  maxTokens: number = CHUNK_SIZE_TOKENS,
-  overlapTokens: number = CHUNK_OVERLAP_TOKENS
-): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
-
-  // Tokenize once upfront
-  const allTokens = await llm.tokenize(content);
-  const totalTokens = allTokens.length;
-
-  if (totalTokens <= maxTokens) {
-    return [{ text: content, pos: 0, tokens: totalTokens }];
-  }
-
-  const chunks: { text: string; pos: number; tokens: number }[] = [];
-  const step = maxTokens - overlapTokens;
-  const avgCharsPerToken = content.length / totalTokens;
-  let tokenPos = 0;
-
-  while (tokenPos < totalTokens) {
-    const chunkEnd = Math.min(tokenPos + maxTokens, totalTokens);
-    const chunkTokens = allTokens.slice(tokenPos, chunkEnd);
-    let chunkText = await llm.detokenize(chunkTokens);
-
-    // Find a good break point if not at end of document
-    if (chunkEnd < totalTokens) {
-      const searchStart = Math.floor(chunkText.length * 0.7);
-      const searchSlice = chunkText.slice(searchStart);
-
-      let breakOffset = -1;
-      const paragraphBreak = searchSlice.lastIndexOf('\n\n');
-      if (paragraphBreak >= 0) {
-        breakOffset = paragraphBreak + 2;
-      } else {
-        const sentenceEnd = Math.max(
-          searchSlice.lastIndexOf('. '),
-          searchSlice.lastIndexOf('.\n'),
-          searchSlice.lastIndexOf('? '),
-          searchSlice.lastIndexOf('?\n'),
-          searchSlice.lastIndexOf('! '),
-          searchSlice.lastIndexOf('!\n')
-        );
-        if (sentenceEnd >= 0) {
-          breakOffset = sentenceEnd + 2;
-        } else {
-          const lineBreak = searchSlice.lastIndexOf('\n');
-          if (lineBreak >= 0) {
-            breakOffset = lineBreak + 1;
-          }
-        }
-      }
-
-      if (breakOffset >= 0) {
-        chunkText = chunkText.slice(0, searchStart + breakOffset);
-      }
-    }
-
-    // Approximate character position based on token position
-    const charPos = Math.floor(tokenPos * avgCharsPerToken);
-    chunks.push({ text: chunkText, pos: charPos, tokens: chunkTokens.length });
-
-    // Move forward
-    if (chunkEnd >= totalTokens) break;
-
-    // Advance by step tokens (maxTokens - overlap)
-    tokenPos += step;
-  }
-
-  return chunks;
-}
+// Token-based chunking removed - using character-based chunking exclusively (chunkDocument)
 
 // =============================================================================
 // Fuzzy matching
@@ -1904,16 +1822,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  // Auto-detect if Gemini embeddings are used and switch model accordingly
-  const storedModel = detectEmbeddingModel(db);
-  const useGemini = storedModel?.startsWith("gemini") || false;
-  const effectiveModel = useGemini ? (storedModel || GEMINI_DEFAULT_MODEL) : model;
-
-  const embedding = await getEmbedding(query, effectiveModel, true, session, useGemini);
+  const embedding = await getGeminiQueryEmbedding(query);
   if (!embedding) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
@@ -2011,14 +1924,8 @@ export async function searchVecZeppelin(
   model: string,
   limit: number = 20,
   collectionName?: string,
-  session?: ILLMSession
 ): Promise<SearchResult[]> {
-  // Auto-detect if Gemini embeddings are used
-  const storedModel = detectEmbeddingModel(db);
-  const useGemini = storedModel?.startsWith("gemini") || false;
-  const effectiveModel = useGemini ? (storedModel || GEMINI_DEFAULT_MODEL) : model;
-
-  const embedding = await getEmbedding(query, effectiveModel, true, session, useGemini);
+  const embedding = await getGeminiQueryEmbedding(query);
   if (!embedding) return [];
 
   // Query Zeppelin for nearest neighbors
@@ -2126,27 +2033,18 @@ function getGeminiEmbedderForSearch(): GeminiEmbedder {
   return _geminiEmbedder;
 }
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, useGemini?: boolean): Promise<number[] | null> {
-  // Use Gemini if explicitly requested or if the model name indicates Gemini
-  if (useGemini || model.startsWith("gemini")) {
-    try {
-      const embedder = getGeminiEmbedderForSearch();
-      // For Gemini, we pass the raw text - no special formatting needed
-      const result = await embedder.embed(text, isQuery);
-      return result?.embedding || null;
-    } catch (err) {
-      console.error("Gemini embedding error:", err);
-      return null;
-    }
+/**
+ * Get a query embedding using Gemini API.
+ */
+async function getGeminiQueryEmbedding(text: string): Promise<number[] | null> {
+  try {
+    const embedder = getGeminiEmbedderForSearch();
+    const result = await embedder.embed(text, true);
+    return result?.embedding || null;
+  } catch (err) {
+    console.error("Gemini embedding error:", err);
+    return null;
   }
-
-  // Use local LLM embedder
-  // Format text using the appropriate prompt template
-  const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
-  const result = session
-    ? await session.embed(formattedText, { model, isQuery })
-    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
-  return result?.embedding || null;
 }
 
 /**
@@ -2192,71 +2090,6 @@ export function insertEmbedding(
 
   insertVecStmt.run(hashSeq, embedding);
   insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt);
-}
-
-// =============================================================================
-// Query expansion
-// =============================================================================
-
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<string[]> {
-  // Check cache first
-  const cacheKey = getCacheKey("expandQuery", { query, model });
-  const cached = getCachedResult(db, cacheKey);
-  if (cached) {
-    const lines = cached.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    return [query, ...lines.slice(0, 2)];
-  }
-
-  const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query);
-  const queryTexts = results.map(r => r.text);
-
-  // Cache the expanded queries (excluding original)
-  const expandedOnly = queryTexts.filter(t => t !== query);
-  if (expandedOnly.length > 0) {
-    setCachedResult(db, cacheKey, expandedOnly.join('\n'));
-  }
-
-  return Array.from(new Set([query, ...queryTexts]));
-}
-
-// =============================================================================
-// Reranking
-// =============================================================================
-
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
-  const cachedResults: Map<string, number> = new Map();
-  const uncachedDocs: RerankDocument[] = [];
-
-  // Check cache for each document
-  for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query, file: doc.file, model });
-    const cached = getCachedResult(db, cacheKey);
-    if (cached !== null) {
-      cachedResults.set(doc.file, parseFloat(cached));
-    } else {
-      uncachedDocs.push({ file: doc.file, text: doc.text });
-    }
-  }
-
-  // Rerank uncached documents using LlamaCpp
-  if (uncachedDocs.length > 0) {
-    const llm = getDefaultLlamaCpp();
-    const rerankResult = await llm.rerank(query, uncachedDocs, { model });
-
-    // Cache results
-    for (const result of rerankResult.results) {
-      const cacheKey = getCacheKey("rerank", { query, file: result.file, model });
-      setCachedResult(db, cacheKey, result.score.toString());
-      cachedResults.set(result.file, result.score);
-    }
-  }
-
-  // Return all results sorted by score
-  return documents
-    .map(doc => ({ file: doc.file, score: cachedResults.get(doc.file) || 0 }))
-    .sort((a, b) => b.score - a.score);
 }
 
 // =============================================================================

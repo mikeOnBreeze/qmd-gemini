@@ -10,7 +10,6 @@ import { Database } from "bun:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "./llm";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -24,11 +23,6 @@ import type { CollectionConfig } from "./collections";
 let testDb: Database;
 let testDbPath: string;
 let testConfigDir: string;
-
-afterAll(async () => {
-  // Ensure native resources are released to avoid ggml-metal asserts on process exit.
-  await disposeDefaultLlamaCpp();
-});
 
 function initTestDatabase(db: Database): void {
   sqliteVec.load(db);
@@ -178,8 +172,6 @@ function seedTestData(db: Database): void {
 import {
   searchFTS,
   searchVec,
-  expandQuery,
-  rerank,
   reciprocalRankFusion,
   extractSnippet,
   getContextForFile,
@@ -188,8 +180,6 @@ import {
   findDocuments,
   getStatus,
   DEFAULT_EMBED_MODEL,
-  DEFAULT_QUERY_MODEL,
-  DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
 } from "./store";
@@ -202,10 +192,6 @@ import type { RankedResult } from "./store";
 
 describe("MCP Server", () => {
   beforeAll(async () => {
-    // LlamaCpp uses node-llama-cpp for local model inference (no HTTP mocking needed)
-    // Use shared singleton to avoid creating multiple instances with separate GPU resources
-    getDefaultLlamaCpp();
-
     // Set up test config directory
     const configPrefix = join(tmpdir(), `qmd-mcp-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     testConfigDir = await mkdtemp(configPrefix);
@@ -295,12 +281,12 @@ describe("MCP Server", () => {
   // ===========================================================================
 
   describe("qmd_vsearch tool", () => {
-    test("returns results for semantic query", async () => {
+    test.skipIf(!process.env.GEMINI_API_KEY)("returns results for semantic query", async () => {
       const results = await searchVec(testDb, "project documentation", DEFAULT_EMBED_MODEL, 10);
       expect(results.length).toBeGreaterThan(0);
     });
 
-    test("respects limit parameter", async () => {
+    test.skipIf(!process.env.GEMINI_API_KEY)("respects limit parameter", async () => {
       const results = await searchVec(testDb, "documentation", DEFAULT_EMBED_MODEL, 2);
       expect(results.length).toBeLessThanOrEqual(2);
     });
@@ -321,13 +307,6 @@ describe("MCP Server", () => {
   // ===========================================================================
 
   describe("qmd_query tool", () => {
-    test("expands query with variations", async () => {
-      const queries = await expandQuery("api documentation", DEFAULT_QUERY_MODEL, testDb);
-      // Always returns at least the original query, may have more if generation succeeds
-      expect(queries.length).toBeGreaterThanOrEqual(1);
-      expect(queries[0]).toBe("api documentation");
-    }, 30000); // 30s timeout for model loading
-
     test("performs RRF fusion on multiple result lists", () => {
       const list1: RankedResult[] = [
         { file: "/a", displayPath: "a.md", title: "A", body: "body", score: 1 },
@@ -345,49 +324,26 @@ describe("MCP Server", () => {
       expect(bResult).toBeDefined();
     });
 
-    test("reranks documents with LLM", async () => {
-      const docs = [
-        { file: "/test/docs/readme.md", text: "Project readme" },
-        { file: "/test/docs/api.md", text: "API documentation" },
-      ];
-      const reranked = await rerank("readme", docs, DEFAULT_RERANK_MODEL, testDb);
-      expect(reranked.length).toBe(2);
-      expect(reranked[0]!.score).toBeGreaterThan(0);
-    });
-
-    test("full hybrid search pipeline", async () => {
-      // Simulate full qmd_query flow
+    test("full hybrid search pipeline (BM25 + RRF)", async () => {
+      // Simulate simplified qmd_query flow: BM25 + vector + RRF (no expansion/reranking)
       const query = "meeting notes";
-      const queries = await expandQuery(query, DEFAULT_QUERY_MODEL, testDb);
 
       const rankedLists: RankedResult[][] = [];
-      for (const q of queries) {
-        const ftsResults = searchFTS(testDb, q, 20);
-        if (ftsResults.length > 0) {
-          rankedLists.push(ftsResults.map(r => ({
-            file: r.filepath,
-            displayPath: r.displayPath,
-            title: r.title,
-            body: r.body || "",
-            score: r.score,
-          })));
-        }
+      const ftsResults = searchFTS(testDb, query, 20);
+      if (ftsResults.length > 0) {
+        rankedLists.push(ftsResults.map(r => ({
+          file: r.filepath,
+          displayPath: r.displayPath,
+          title: r.title,
+          body: r.body || "",
+          score: r.score,
+        })));
       }
 
       expect(rankedLists.length).toBeGreaterThan(0);
 
       const fused = reciprocalRankFusion(rankedLists);
       expect(fused.length).toBeGreaterThan(0);
-
-      const candidates = fused.slice(0, 10);
-      const reranked = await rerank(
-        query,
-        candidates.map(c => ({ file: c.file, text: c.body })),
-        DEFAULT_RERANK_MODEL,
-        testDb
-      );
-
-      expect(reranked.length).toBeGreaterThan(0);
     });
   });
 

@@ -2,8 +2,6 @@
  * store.test.ts - Comprehensive unit tests for the QMD store module
  *
  * Run with: bun test store.test.ts
- *
- * LLM operations use LlamaCpp with local GGUF models (node-llama-cpp).
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, mock, spyOn } from "bun:test";
@@ -12,7 +10,6 @@ import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
-import { disposeDefaultLlamaCpp } from "./llm.js";
 import {
   createStore,
   getDefaultDbPath,
@@ -25,7 +22,6 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   chunkDocument,
-  chunkDocumentByTokens,
   reciprocalRankFusion,
   extractSnippet,
   getCacheKey,
@@ -44,11 +40,6 @@ import type { CollectionConfig } from "./collections.js";
 
 // =============================================================================
 // LlamaCpp Setup
-// =============================================================================
-
-// Note: LlamaCpp uses node-llama-cpp for local GGUF model inference.
-// No HTTP mocking needed - tests use real LlamaCpp calls for integration tests.
-
 // =============================================================================
 // Test Utilities
 // =============================================================================
@@ -221,9 +212,6 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  // Ensure native resources are released to avoid ggml-metal asserts on process exit.
-  await disposeDefaultLlamaCpp();
-
   try {
     // Clean up test directory
     const { readdir, unlink } = await import("node:fs/promises");
@@ -599,65 +587,6 @@ describe("Document Chunking", () => {
     // Each chunk should be around 3200 chars (except last)
     expect(chunks[0]!.text.length).toBeGreaterThan(2500);
     expect(chunks[0]!.text.length).toBeLessThanOrEqual(3200);
-  });
-});
-
-describe("Token-based Chunking", () => {
-  test("chunkDocumentByTokens returns single chunk for small documents", async () => {
-    const content = "This is a small document.";
-    const chunks = await chunkDocumentByTokens(content, 800, 120);
-    expect(chunks).toHaveLength(1);
-    expect(chunks[0]!.text).toBe(content);
-    expect(chunks[0]!.pos).toBe(0);
-    expect(chunks[0]!.tokens).toBeGreaterThan(0);
-    expect(chunks[0]!.tokens).toBeLessThan(800);
-  });
-
-  test("chunkDocumentByTokens splits large documents", async () => {
-    // Create a document that's definitely more than 800 tokens
-    const content = "The quick brown fox jumps over the lazy dog. ".repeat(200);
-    const chunks = await chunkDocumentByTokens(content, 800, 120);
-
-    expect(chunks.length).toBeGreaterThan(1);
-
-    // Each chunk should have ~800 tokens or less
-    for (const chunk of chunks) {
-      expect(chunk.tokens).toBeLessThanOrEqual(850);  // Allow slight overage
-      expect(chunk.tokens).toBeGreaterThan(0);
-    }
-
-    // Chunks should have correct positions
-    for (let i = 0; i < chunks.length; i++) {
-      expect(chunks[i]!.pos).toBeGreaterThanOrEqual(0);
-      if (i > 0) {
-        expect(chunks[i]!.pos).toBeGreaterThan(chunks[i - 1]!.pos);
-      }
-    }
-  });
-
-  test("chunkDocumentByTokens creates overlapping chunks", async () => {
-    const content = "Word ".repeat(500);  // ~500 tokens
-    const chunks = await chunkDocumentByTokens(content, 200, 30);  // 15% overlap
-
-    expect(chunks.length).toBeGreaterThan(1);
-
-    // With overlap, consecutive chunks should have overlapping positions
-    for (let i = 1; i < chunks.length; i++) {
-      const prevEnd = chunks[i - 1]!.pos + chunks[i - 1]!.text.length;
-      const currentStart = chunks[i]!.pos;
-      // Current chunk should start before the previous chunk ended (overlap)
-      expect(currentStart).toBeLessThan(prevEnd);
-    }
-  });
-
-  test("chunkDocumentByTokens returns actual token counts", async () => {
-    const content = "Hello world, this is a test.";
-    const chunks = await chunkDocumentByTokens(content);
-
-    expect(chunks).toHaveLength(1);
-    // The token count should be reasonable (not 0, not equal to char count)
-    expect(chunks[0]!.tokens).toBeGreaterThan(0);
-    expect(chunks[0]!.tokens).toBeLessThan(content.length);  // Tokens < chars for English
   });
 });
 
@@ -1769,10 +1698,10 @@ describe("Integration", () => {
 });
 
 // =============================================================================
-// LlamaCpp Integration Tests (using real local models)
+// Vector Search Integration Tests
 // =============================================================================
 
-describe("LlamaCpp Integration", () => {
+describe("Vector Search Integration", () => {
   test("searchVec returns empty when no vector index", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -1788,7 +1717,7 @@ describe("LlamaCpp Integration", () => {
     await cleanupTestDb(store);
   });
 
-  test("searchVec returns results when vector index exists", async () => {
+  test.skipIf(!process.env.GEMINI_API_KEY)("searchVec returns results when vector index exists", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
 
@@ -1816,7 +1745,7 @@ describe("LlamaCpp Integration", () => {
     await cleanupTestDb(store);
   });
 
-  test("searchVec filters by collection name", async () => {
+  test.skipIf(!process.env.GEMINI_API_KEY)("searchVec filters by collection name", async () => {
     const store = await createTestStore();
     const collection1 = await createTestCollection({ name: "coll1", pwd: "/test/coll1" });
     const collection2 = await createTestCollection({ name: "coll2", pwd: "/test/coll2" });
@@ -1860,7 +1789,7 @@ describe("LlamaCpp Integration", () => {
   // Regression test for https://github.com/tobi/qmd/pull/23
   // sqlite-vec virtual tables hang when combined with JOINs in the same query.
   // The fix uses a two-step approach: vector query first, then separate JOINs.
-  test("searchVec uses two-step query to avoid sqlite-vec JOIN hang", async () => {
+  test.skipIf(!process.env.GEMINI_API_KEY)("searchVec uses two-step query to avoid sqlite-vec JOIN hang", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
 
@@ -1889,62 +1818,6 @@ describe("LlamaCpp Integration", () => {
     // (the hang bug would cause it to never return at all)
     expect(elapsed).toBeLessThan(5000);
     expect(results.length).toBeGreaterThan(0);
-
-    await cleanupTestDb(store);
-  });
-
-  test("expandQuery returns original plus expanded queries", async () => {
-    const store = await createTestStore();
-
-    const queries = await store.expandQuery("test query");
-    expect(queries).toContain("test query");
-    expect(queries[0]).toBe("test query");
-    // LlamaCpp returns original + variations
-    expect(queries.length).toBeGreaterThanOrEqual(1);
-
-    await cleanupTestDb(store);
-  }, 30000);
-
-  test("expandQuery caches results", async () => {
-    const store = await createTestStore();
-
-    // First call
-    const queries1 = await store.expandQuery("cached query test");
-    // Second call - should hit cache
-    const queries2 = await store.expandQuery("cached query test");
-
-    expect(queries1[0]).toBe(queries2[0]);
-
-    await cleanupTestDb(store);
-  }, 30000);
-
-  test("rerank scores documents", async () => {
-    const store = await createTestStore();
-
-    const docs = [
-      { file: "doc1.md", text: "Relevant content about the topic" },
-      { file: "doc2.md", text: "Other content" },
-    ];
-
-    const results = await store.rerank("topic", docs);
-    expect(results).toHaveLength(2);
-    // LlamaCpp reranker returns relevance scores
-    expect(results[0]!.score).toBeGreaterThan(0);
-
-    await cleanupTestDb(store);
-  });
-
-  test("rerank caches results", async () => {
-    const store = await createTestStore();
-
-    const docs = [{ file: "doc1.md", text: "Content for caching test" }];
-
-    // First call
-    await store.rerank("cache test query", docs);
-    // Second call - should hit cache
-    const results = await store.rerank("cache test query", docs);
-
-    expect(results).toHaveLength(1);
 
     await cleanupTestDb(store);
   });
