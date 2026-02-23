@@ -8,8 +8,9 @@ Fast markdown search with Gemini embeddings. Fork of [qmd](https://github.com/to
 
 - **BM25 search** (`qmd search`) — Fast keyword matching
 - **Vector search** (`qmd vsearch`) — Semantic similarity via Gemini embeddings
+- **Zeppelin backend** — High-performance vector search powered by [Zeppelin](https://github.com/Ghatage/zeppelin) by [@Ghatage](https://github.com/Ghatage), an S3-native vector search engine
 - **No local models** — All embeddings via Gemini API
-- **SQLite storage** — Portable, single-file index
+- **SQLite storage** — Portable, single-file index for documents and BM25
 
 ## Quick Start
 
@@ -154,16 +155,36 @@ Or add manually via the Clawdbot dashboard.
 ## How It Works
 
 1. **Indexing:** `qmd collection add` indexes markdown files into SQLite
-2. **Embedding:** `qmd embed` chunks documents (~800 tokens), sends to Gemini API, stores vectors
+2. **Embedding:** `qmd embed` chunks documents (~800 tokens), sends to Gemini API, stores vectors in [Zeppelin](https://github.com/Ghatage/zeppelin)
 3. **BM25 Search:** `qmd search` does fast keyword matching (no API call)
-4. **Vector Search:** `qmd vsearch` embeds your query via Gemini, finds similar chunks
+4. **Vector Search:** `qmd vsearch` embeds your query via Gemini, searches nearest neighbors via Zeppelin
 
 Vector search requires `GEMINI_API_KEY` at search time (to embed the query).
+
+### Zeppelin
+
+Vector storage and similarity search is powered by [Zeppelin](https://github.com/Ghatage/zeppelin) by [@Ghatage](https://github.com/Ghatage) — a fully open-source, S3-native vector search engine. Nodes are stateless and object storage is the source of truth, which makes it lightweight and easy to run locally or at scale. Zeppelin is the default backend for all vector operations (`embed`, `vsearch`, `query`).
+
+```bash
+# Start Zeppelin locally
+docker compose up  # Zeppelin on :8080, MinIO on :9000
+
+# Or point to a remote instance
+export ZEPPELIN_URL=http://your-server:8080
+```
+
+You can fall back to local sqlite-vec storage with `--store sqlite` if needed.
 
 ## Requirements
 
 - [Bun](https://bun.sh/) runtime
 - Gemini API key (free tier works fine)
+- [Zeppelin](https://github.com/Ghatage/zeppelin) server (included via `docker compose up`)
+
+## Acknowledgments
+
+- [Zeppelin](https://github.com/Ghatage/zeppelin) by [@Ghatage](https://github.com/Ghatage) — the S3-native vector search engine that powers qmd-gemini's vector storage and similarity search
+- [qmd](https://github.com/tobi/qmd) by [@tobi](https://github.com/tobi) — the original project this is forked from
 
 ## License
 
