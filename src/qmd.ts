@@ -12,6 +12,7 @@ import {
   enableProductionMode,
   searchFTS,
   searchVec,
+  searchVecZeppelin,
   extractSnippet,
   getContextForFile,
   getContextForPath,
@@ -69,12 +70,14 @@ import {
 } from "./store.js";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
 import { GeminiEmbedder, createGeminiEmbedder, GEMINI_DEFAULT_DIMENSIONS, GEMINI_DEFAULT_MODEL } from "./llm-gemini.js";
+import { ZeppelinVectorStore, getZeppelinStore, ZeppelinError } from "./vector-store-zeppelin.js";
 
 // =============================================================================
 // Embedding Provider Types
 // =============================================================================
 
 export type EmbedProvider = "local" | "gemini";
+export type VectorStoreType = "sqlite" | "zeppelin";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
   formatSearchResults,
@@ -1497,14 +1500,37 @@ function renderProgressBar(percent: number, width: number = 30): string {
   return bar;
 }
 
-async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false, provider: EmbedProvider = "local"): Promise<void> {
+async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false, provider: EmbedProvider = "local", vectorStore: VectorStoreType = "sqlite"): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
+
+  // Initialize Zeppelin store if selected
+  let zeppelin: ZeppelinVectorStore | null = null;
+  if (vectorStore === "zeppelin") {
+    zeppelin = getZeppelinStore();
+    const available = await zeppelin.isAvailable();
+    if (!available) {
+      const url = process.env.ZEPPELIN_URL || "http://localhost:8080";
+      console.error(`${c.yellow}Error: Zeppelin server not available at ${url}${c.reset}`);
+      console.error(`${c.dim}Start it with: docker compose up${c.reset}`);
+      console.error(`${c.dim}Or set ZEPPELIN_URL to your server address${c.reset}`);
+      closeDb();
+      return;
+    }
+  }
 
   // If force, clear all vectors
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
     clearAllEmbeddings(db);
+    if (zeppelin) {
+      try {
+        await zeppelin.deleteNamespace();
+        console.log(`${c.dim}Cleared Zeppelin namespace${c.reset}`);
+      } catch {
+        // Namespace might not exist yet, that's fine
+      }
+    }
   }
 
   // Find unique hashes that need embedding (from active documents)
@@ -1569,7 +1595,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   if (multiChunkDocs > 0) {
     console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
   }
-  console.log(`${c.dim}Provider: ${provider}, Model: ${displayModel}${c.reset}\n`);
+  console.log(`${c.dim}Provider: ${provider}, Model: ${displayModel}, Store: ${vectorStore}${c.reset}\n`);
 
   // Hide cursor during embedding
   cursor.hide();
@@ -1586,11 +1612,23 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       return;
     }
 
-    // Ensure vector table has correct dimensions
-    ensureVecTable(db, geminiEmbedder.getDimensions());
+    // Ensure vector storage has correct dimensions
+    const embDimensions = geminiEmbedder.getDimensions();
+    if (vectorStore === "zeppelin" && zeppelin) {
+      await zeppelin.ensureNamespace(embDimensions);
+    } else {
+      ensureVecTable(db, embDimensions);
+    }
 
     let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
     const startTime = Date.now();
+
+    // Zeppelin batch buffer for efficient upserts
+    const zeppelinBuffer: Array<{
+      hash: string; seq: number; pos: number;
+      embedding: number[] | Float32Array;
+      collection?: string; path?: string; title?: string; model: string;
+    }> = [];
 
     // Batch embedding - Gemini can handle larger batches
     const BATCH_SIZE = 100;
@@ -1612,7 +1650,16 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
           const embedding = embeddings[i];
 
           if (embedding) {
-            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), GEMINI_DEFAULT_MODEL, now);
+            if (vectorStore === "zeppelin") {
+              zeppelinBuffer.push({
+                hash: chunk.hash, seq: chunk.seq, pos: chunk.pos,
+                embedding: embedding.embedding,
+                path: chunk.displayName, title: chunk.title,
+                model: GEMINI_DEFAULT_MODEL,
+              });
+            } else {
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), GEMINI_DEFAULT_MODEL, now);
+            }
             chunksEmbedded++;
           } else {
             errors++;
@@ -1627,7 +1674,16 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
             const text = formatDocForEmbedding(chunk.text, chunk.title);
             const result = await geminiEmbedder.embed(text, false);
             if (result) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), GEMINI_DEFAULT_MODEL, now);
+              if (vectorStore === "zeppelin") {
+                zeppelinBuffer.push({
+                  hash: chunk.hash, seq: chunk.seq, pos: chunk.pos,
+                  embedding: result.embedding,
+                  path: chunk.displayName, title: chunk.title,
+                  model: GEMINI_DEFAULT_MODEL,
+                });
+              } else {
+                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), GEMINI_DEFAULT_MODEL, now);
+              }
               chunksEmbedded++;
             } else {
               errors++;
@@ -1638,6 +1694,12 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
           }
           bytesProcessed += chunk.bytes;
         }
+      }
+
+      // Flush Zeppelin buffer periodically (every 200 embeddings)
+      if (vectorStore === "zeppelin" && zeppelin && zeppelinBuffer.length >= 200) {
+        await zeppelin.upsertEmbeddingBatch(zeppelinBuffer);
+        zeppelinBuffer.length = 0;
       }
 
       const percent = (bytesProcessed / totalBytes) * 100;
@@ -1657,6 +1719,12 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
     }
 
+    // Flush remaining Zeppelin buffer
+    if (vectorStore === "zeppelin" && zeppelin && zeppelinBuffer.length > 0) {
+      await zeppelin.upsertEmbeddingBatch(zeppelinBuffer);
+      zeppelinBuffer.length = 0;
+    }
+
     progress.clear();
     cursor.show();
     const totalTimeSec = (Date.now() - startTime) / 1000;
@@ -1666,6 +1734,9 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
     if (errors > 0) {
       console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
+    }
+    if (vectorStore === "zeppelin") {
+      console.log(`${c.dim}Stored in Zeppelin at ${process.env.ZEPPELIN_URL || "http://localhost:8080"}${c.reset}`);
     }
 
   } else {
@@ -1684,7 +1755,19 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       if (!firstResult) {
         throw new Error("Failed to get embedding dimensions from first chunk");
       }
-      ensureVecTable(db, firstResult.embedding.length);
+      const localEmbDims = firstResult.embedding.length;
+      if (vectorStore === "zeppelin" && zeppelin) {
+        await zeppelin.ensureNamespace(localEmbDims);
+      } else {
+        ensureVecTable(db, localEmbDims);
+      }
+
+      // Zeppelin batch buffer for local LLM path
+      const localZeppelinBuffer: Array<{
+        hash: string; seq: number; pos: number;
+        embedding: number[] | Float32Array;
+        collection?: string; path?: string; title?: string; model: string;
+      }> = [];
 
       let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
       const startTime = Date.now();
@@ -1710,7 +1793,16 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
             const embedding = embeddings[i];
 
             if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+              if (vectorStore === "zeppelin") {
+                localZeppelinBuffer.push({
+                  hash: chunk.hash, seq: chunk.seq, pos: chunk.pos,
+                  embedding: embedding.embedding,
+                  path: chunk.displayName, title: chunk.title,
+                  model,
+                });
+              } else {
+                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+              }
               chunksEmbedded++;
             } else {
               errors++;
@@ -1725,7 +1817,16 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
               const text = formatDocForEmbedding(chunk.text, chunk.title);
               const result = await session.embed(text);
               if (result) {
-                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+                if (vectorStore === "zeppelin") {
+                  localZeppelinBuffer.push({
+                    hash: chunk.hash, seq: chunk.seq, pos: chunk.pos,
+                    embedding: result.embedding,
+                    path: chunk.displayName, title: chunk.title,
+                    model,
+                  });
+                } else {
+                  insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+                }
                 chunksEmbedded++;
               } else {
                 errors++;
@@ -1736,6 +1837,12 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
             }
             bytesProcessed += chunk.bytes;
           }
+        }
+
+        // Flush Zeppelin buffer periodically
+        if (vectorStore === "zeppelin" && zeppelin && localZeppelinBuffer.length >= 200) {
+          await zeppelin.upsertEmbeddingBatch(localZeppelinBuffer);
+          localZeppelinBuffer.length = 0;
         }
 
         const percent = (bytesProcessed / totalBytes) * 100;
@@ -1755,6 +1862,12 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
         process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
       }
 
+      // Flush remaining Zeppelin buffer
+      if (vectorStore === "zeppelin" && zeppelin && localZeppelinBuffer.length > 0) {
+        await zeppelin.upsertEmbeddingBatch(localZeppelinBuffer);
+        localZeppelinBuffer.length = 0;
+      }
+
       progress.clear();
       cursor.show();
       const totalTimeSec = (Date.now() - startTime) / 1000;
@@ -1764,6 +1877,9 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
       if (errors > 0) {
         console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
+      }
+      if (vectorStore === "zeppelin") {
+        console.log(`${c.dim}Stored in Zeppelin at ${process.env.ZEPPELIN_URL || "http://localhost:8080"}${c.reset}`);
       }
     }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
   }
@@ -1872,6 +1988,7 @@ type OutputOptions = {
   lineNumbers?: boolean; // Add line numbers to output
   context?: string;      // Optional context for query expansion
   raw?: boolean;         // Skip query expansion, pure vector similarity (no local LLM)
+  store?: VectorStoreType; // Vector storage backend: "sqlite" (default) or "zeppelin"
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2072,6 +2189,7 @@ function search(query: string, opts: OutputOptions): void {
 
 async function vectorSearch(query: string, opts: OutputOptions, model: string = DEFAULT_EMBED_MODEL): Promise<void> {
   const db = getDb();
+  const useZeppelin = opts.store === "zeppelin";
 
   // Validate collection filter if specified
   let collectionName: string | undefined;
@@ -2085,11 +2203,23 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
     collectionName = opts.collection;
   }
 
-  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-  if (!tableExists) {
-    console.error("Vector index not found. Run 'qmd embed' first to create embeddings.");
-    closeDb();
-    return;
+  if (useZeppelin) {
+    // Zeppelin search path - check server availability
+    const zeppelin = getZeppelinStore();
+    const available = await zeppelin.isAvailable();
+    if (!available) {
+      const url = process.env.ZEPPELIN_URL || "http://localhost:8080";
+      console.error(`Zeppelin server not available at ${url}. Start it with: docker compose up`);
+      closeDb();
+      return;
+    }
+  } else {
+    const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+    if (!tableExists) {
+      console.error("Vector index not found. Run 'qmd embed' first to create embeddings.");
+      closeDb();
+      return;
+    }
   }
 
   // Check index health and warn about issues
@@ -2099,7 +2229,13 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   // Gemini API for embeddings, let calling LLM rank results
   if (true) {
     const perQueryLimit = opts.all ? 500 : (opts.limit || 5);
-    const results = await searchVec(db, query, model, perQueryLimit, collectionName);
+
+    let results: Awaited<ReturnType<typeof searchVec>>;
+    if (useZeppelin) {
+      results = await searchVecZeppelin(db, getZeppelinStore(), query, model, perQueryLimit, collectionName);
+    } else {
+      results = await searchVec(db, query, model, perQueryLimit, collectionName);
+    }
     
     // Map to the format outputResults expects
     const mapped = results.map(r => ({
@@ -2234,7 +2370,8 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
 
   // Run initial BM25 search (will be reused for retrieval)
   const initialFts = searchFTS(db, query, 20, collectionName as any);
-  let hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  const useZeppelin = opts.store === "zeppelin";
+  let hasVectors = useZeppelin || !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   // Check if initial results have strong signals (skip expansion if so)
   // Strong signal = top result is strong AND clearly separated from runner-up.
@@ -2302,7 +2439,9 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
       for (const q of vectorQueries) {
         if (!q) continue;
         searchPromises.push((async () => {
-          const vecResults = await searchVec(db, q, embedModel, 20, (collectionName || "") as any, session);
+          const vecResults = useZeppelin
+            ? await searchVecZeppelin(db, getZeppelinStore(), q, embedModel, 20, (collectionName || "") as any, session)
+            : await searchVec(db, q, embedModel, 20, (collectionName || "") as any, session);
           if (vecResults.length > 0) {
             for (const r of vecResults) hashMap.set(r.filepath, r.hash);
             rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
@@ -2454,6 +2593,7 @@ function parseCLI() {
       // Embed options
       force: { type: "boolean", short: "f" },
       provider: { type: "string", short: "p" },  // "local" or "gemini"
+      store: { type: "string", short: "s" },  // "sqlite" or "zeppelin"
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -2498,6 +2638,7 @@ function parseCLI() {
     collection: values.collection as string | undefined,
     lineNumbers: !!values["line-numbers"],
     raw: !!values.raw,
+    store: (values.store as VectorStoreType) || undefined,
   };
 
   return {
@@ -2554,6 +2695,10 @@ function showHelp(): void {
   console.log("Embedding providers:");
   console.log("  --provider local   - Use local GGUF models (not recommended)");
   console.log("  --provider gemini  - Use Google Gemini API (requires GEMINI_API_KEY env var)");
+  console.log("");
+  console.log("Vector storage backends:");
+  console.log("  --store sqlite     - Local sqlite-vec storage (default)");
+  console.log("  --store zeppelin   - Zeppelin vector search engine (requires running server)");
   console.log("");
   console.log("Local models (auto-downloaded from HuggingFace):");
   console.log("  Embedding: embeddinggemma-300M-Q8_0");
@@ -2749,7 +2894,13 @@ if (import.meta.main) {
         console.error("Available providers: local, gemini");
         process.exit(1);
       }
-      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force, provider as EmbedProvider);
+      const vectorStore = (cli.values.store as string) || "sqlite";
+      if (vectorStore !== "sqlite" && vectorStore !== "zeppelin") {
+        console.error(`Unknown store: ${vectorStore}`);
+        console.error("Available stores: sqlite, zeppelin");
+        process.exit(1);
+      }
+      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force, provider as EmbedProvider, vectorStore as VectorStoreType);
       break;
     }
 

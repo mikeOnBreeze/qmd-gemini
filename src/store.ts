@@ -24,6 +24,7 @@ import {
   type ILLMSession,
 } from "./llm";
 import { createGeminiEmbedder, GEMINI_DEFAULT_MODEL, type GeminiEmbedder } from "./llm-gemini";
+import { type ZeppelinVectorStore } from "./vector-store-zeppelin";
 import {
   findContextForPath as collectionsFindContextForPath,
   addContext as collectionsAddContext,
@@ -1990,6 +1991,104 @@ export async function searchVec(db: Database, query: string, model: string, limi
         score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
+      };
+    });
+}
+
+// =============================================================================
+// Vector Search via Zeppelin
+// =============================================================================
+
+/**
+ * Vector similarity search using a Zeppelin server as the vector backend.
+ * Generates the query embedding locally (Gemini or local LLM), sends it to
+ * Zeppelin for ANN search, then looks up full document content from SQLite.
+ */
+export async function searchVecZeppelin(
+  db: Database,
+  zeppelin: ZeppelinVectorStore,
+  query: string,
+  model: string,
+  limit: number = 20,
+  collectionName?: string,
+  session?: ILLMSession
+): Promise<SearchResult[]> {
+  // Auto-detect if Gemini embeddings are used
+  const storedModel = detectEmbeddingModel(db);
+  const useGemini = storedModel?.startsWith("gemini") || false;
+  const effectiveModel = useGemini ? (storedModel || GEMINI_DEFAULT_MODEL) : model;
+
+  const embedding = await getEmbedding(query, effectiveModel, true, session, useGemini);
+  if (!embedding) return [];
+
+  // Query Zeppelin for nearest neighbors
+  const zepResults = await zeppelin.search(embedding, {
+    topK: limit * 3, // Over-fetch for dedup
+    collection: collectionName,
+  });
+
+  if (zepResults.length === 0) return [];
+
+  // Look up full document content from SQLite
+  const hashes = [...new Set(zepResults.map(r => r.hash))];
+  const placeholders = hashes.map(() => '?').join(',');
+
+  let docSql = `
+    SELECT
+      d.hash,
+      'qmd://' || d.collection || '/' || d.path as filepath,
+      d.collection || '/' || d.path as display_path,
+      d.title,
+      content.doc as body
+    FROM documents d
+    JOIN content ON content.hash = d.hash
+    WHERE d.active = 1 AND d.hash IN (${placeholders})
+  `;
+  const params: string[] = [...hashes];
+
+  if (collectionName) {
+    docSql += ` AND d.collection = ?`;
+    params.push(collectionName);
+  }
+
+  const docRows = db.prepare(docSql).all(...params) as {
+    hash: string; filepath: string; display_path: string;
+    title: string; body: string;
+  }[];
+
+  const docMap = new Map(docRows.map(r => [r.hash, r]));
+
+  // Combine with Zeppelin scores and dedupe by filepath
+  const seen = new Map<string, { doc: typeof docRows[0]; score: number; pos: number }>();
+  for (const zr of zepResults) {
+    const doc = docMap.get(zr.hash);
+    if (!doc) continue;
+
+    const existing = seen.get(doc.filepath);
+    if (!existing || zr.score > existing.score) {
+      seen.set(doc.filepath, { doc, score: zr.score, pos: zr.pos });
+    }
+  }
+
+  return Array.from(seen.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map(({ doc, score, pos }) => {
+      const collName = doc.filepath.split('//')[1]?.split('/')[0] || "";
+      return {
+        filepath: doc.filepath,
+        displayPath: doc.display_path,
+        title: doc.title,
+        hash: doc.hash,
+        docid: getDocid(doc.hash),
+        collectionName: collName,
+        modifiedAt: "",
+        bodyLength: doc.body.length,
+        body: doc.body,
+        context: getContextForFile(db, doc.filepath),
+        score,
+        source: "vec" as const,
+        chunkPos: pos,
       };
     });
 }

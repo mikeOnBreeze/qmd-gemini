@@ -19,8 +19,10 @@ qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated
 qmd status                        # Show index status and collections
 qmd update [--pull]               # Re-index all collections (--pull: git pull first)
 qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
+qmd embed --store zeppelin        # Embed and store vectors in Zeppelin server
 qmd search <query>                # BM25 full-text search
 qmd vsearch <query>               # Vector similarity search
+qmd vsearch <query> --store zeppelin  # Vector search via Zeppelin
 qmd query <query>                 # Hybrid search with reranking (best quality)
 ```
 
@@ -121,10 +123,32 @@ bun link               # Install globally as 'qmd'
 ## Architecture
 
 - SQLite FTS5 for full-text search (BM25)
-- sqlite-vec for vector similarity search
+- sqlite-vec for vector similarity search (default backend)
+- Zeppelin for optional high-performance vector search (S3-native, IVF indexing)
 - node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
+- Gemini API for cloud-based embeddings (gemini-embedding-001)
 - Reciprocal Rank Fusion (RRF) for combining results
 - Token-based chunking: 800 tokens/chunk with 15% overlap
+
+### Zeppelin Vector Backend
+
+Zeppelin (https://github.com/Ghatage/zeppelin) is an optional S3-native vector search engine.
+Use `--store zeppelin` with embed/vsearch/query commands to use it instead of sqlite-vec.
+
+```sh
+# Start Zeppelin locally
+docker compose up  # Zeppelin on :8080, MinIO on :9000
+
+# Set custom URL (default: http://localhost:8080)
+export ZEPPELIN_URL=http://localhost:8080
+
+# Embed with Zeppelin storage
+qmd embed --store zeppelin
+
+# Search via Zeppelin
+qmd vsearch "my query" --store zeppelin
+qmd query "my query" --store zeppelin
+```
 
 ## Important: Do NOT run automatically
 
