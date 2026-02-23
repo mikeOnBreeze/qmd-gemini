@@ -10,5 +10,6 @@ texts/
 !CLAUDE.md
 !skills/**/*.md
 !finetune/*.md
+!test/eval-docs/*.md
 finetune/outputs/
 finetune/data/train/
