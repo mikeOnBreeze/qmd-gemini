@@ -1473,7 +1473,7 @@ function renderProgressBar(percent: number, width: number = 30): string {
   return bar;
 }
 
-async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false, vectorStore: VectorStoreType = "sqlite"): Promise<void> {
+async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false, vectorStore: VectorStoreType = "zeppelin"): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
 
@@ -2215,7 +2215,7 @@ function parseCLI() {
     collection: values.collection as string | undefined,
     lineNumbers: !!values["line-numbers"],
     raw: !!values.raw,
-    store: (values.store as VectorStoreType) || undefined,
+    store: (values.store as VectorStoreType) || "zeppelin",
   };
 
   return {
@@ -2270,8 +2270,8 @@ function showHelp(): void {
   console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
   console.log("");
   console.log("Vector storage backends:");
-  console.log("  --store sqlite     - Local sqlite-vec storage (default)");
-  console.log("  --store zeppelin   - Zeppelin vector search engine (requires running server)");
+  console.log("  --store zeppelin   - Zeppelin vector search engine (default)");
+  console.log("  --store sqlite     - Local sqlite-vec storage");
   console.log("");
   console.log("Embedding model: Gemini gemini-embedding-001 (768 dimensions, requires GEMINI_API_KEY)");
   console.log("");
@@ -2456,7 +2456,7 @@ if (import.meta.main) {
       break;
 
     case "embed": {
-      const vectorStore = (cli.values.store as string) || "sqlite";
+      const vectorStore = (cli.values.store as string) || "zeppelin";
       if (vectorStore !== "sqlite" && vectorStore !== "zeppelin") {
         console.error(`Unknown store: ${vectorStore}`);
         console.error("Available stores: sqlite, zeppelin");
