@@ -1,8 +1,12 @@
 # qmd-gemini
 
-Fast markdown search with Gemini embeddings. Fork of [qmd](https://github.com/tobi/qmd) optimized for Clawdbot agents.
+[@tobi](https://github.com/tobi) built [qmd](https://github.com/tobi/qmd) — an incredible memory system for Clawdbot that gives your agent real search over your markdown files. BM25 keyword search, vector similarity, the whole deal. It's sick.
 
-**Key difference:** Uses Google Gemini API for embeddings instead of local models. No 1.3GB downloads. Just fast, cloud-based vector search.
+One catch: the original runs embeddings locally with node-llama-cpp, which means downloading a 1.3GB model and having a machine beefy enough to chew through it. If you're rocking a maxed-out setup, ride that wave. But for the rest of us on base-model MacBook Airs and budget Linux boxes — that's a no-go.
+
+**qmd-gemini** swaps the local model for the Gemini API. Same great search, pennies a day, runs anywhere. No giant downloads, no GPU, no sweat.
+
+Then we supercharged it with [@Ghatage](https://github.com/Ghatage)'s [Zeppelin](https://github.com/Ghatage/zeppelin) — an S3-native vector search engine that's crazy fast. Instead of stuffing vectors into SQLite, your embeddings live in a proper vector backend built for the job. Stateless nodes, object storage as the source of truth, IVF indexing. It rips.
 
 ## Features
 
