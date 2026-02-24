@@ -169,13 +169,25 @@ Vector search requires `GEMINI_API_KEY` at search time (to embed the query).
 
 Vector storage and similarity search is powered by [Zeppelin](https://github.com/Ghatage/zeppelin) by [@Ghatage](https://github.com/Ghatage) — a fully open-source, S3-native vector search engine. Nodes are stateless and object storage is the source of truth, which makes it lightweight and easy to run locally or at scale.
 
-Zeppelin is a standalone server — you can run it however you want (binary, Docker, on a remote box, etc.). Just point qmd at it:
+A `docker-compose.yml` is included to run Zeppelin + MinIO locally. First run builds Zeppelin from source (~1-2 min), then it's cached:
 
 ```bash
-# Set the Zeppelin URL (default: http://localhost:8080)
-export ZEPPELIN_URL=http://localhost:8080
+# Start Zeppelin locally (builds from source on first run)
+docker compose up
 
-# Embed and search with Zeppelin
+# Zeppelin: http://localhost:8080
+# MinIO Console: http://localhost:9001
+```
+
+Or point at any running Zeppelin instance:
+
+```bash
+export ZEPPELIN_URL=http://your-server:8080
+```
+
+Then embed and search:
+
+```bash
 ./qmd embed --store zeppelin
 ./qmd vsearch "my query" --store zeppelin
 ```
@@ -186,7 +198,7 @@ You can fall back to local sqlite-vec storage with `--store sqlite` if needed (t
 
 - [Bun](https://bun.sh/) runtime
 - Gemini API key (free tier works fine)
-- [Zeppelin](https://github.com/Ghatage/zeppelin) server for vector search (optional — falls back to sqlite-vec)
+- Docker (only if running Zeppelin locally — optional, falls back to sqlite-vec)
 
 ## Acknowledgments
 
