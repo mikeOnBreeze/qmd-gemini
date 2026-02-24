@@ -1655,6 +1655,12 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
 
       process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+
+      // Rate limit: wait 10 seconds between batches to stay under Gemini's 1M TPM limit
+      // (100 chunks × ~800 tokens = 80K tokens/batch, need ~6 batches/min to be safe)
+      if (batchEnd < allChunks.length) {
+        await new Promise(resolve => setTimeout(resolve, 10000));
+      }
     }
 
     progress.clear();
